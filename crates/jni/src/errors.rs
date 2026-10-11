@@ -102,6 +102,11 @@ pub enum Error {
     NoSuchMethod(String),
     #[error("Field not found: {name} {sig}")]
     FieldNotFound { name: String, sig: String },
+    /// A [`bind_java_type!`](crate::bind_java_type) `map_member` hook returned
+    /// a name or signature that isn't compatible with the binding, such as a
+    /// signature with different argument or return types.
+    #[error("Invalid member mapping: {0}")]
+    InvalidMemberMapping(String),
     #[error("Java exception was thrown")]
     JavaException,
     #[error("Exception in initializer")]

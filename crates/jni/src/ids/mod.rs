@@ -9,3 +9,6 @@ pub use jfieldid::*;
 
 mod jstaticfieldid;
 pub use jstaticfieldid::*;
+
+mod member_lookup;
+pub use member_lookup::*;

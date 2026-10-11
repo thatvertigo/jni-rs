@@ -548,6 +548,72 @@ The `load_class` hook must be an inline closure that receives:
 
 The closure must return `Result<JClass<'local>, jni::errors::Error>`.
 
+### Runtime Member Names
+
+A `map_member` hook can change the name and signature used to look up each method, field and
+constructor ID at runtime. This allows one binding, written against readable names, to be used
+with builds of a library where members are named differently at runtime, such as obfuscated or
+remapped builds. A `load_class` hook can load the class itself under its runtime name:
+
+```rust
+use jni::bind_java_type;
+use jni::ids::MemberKind;
+use jni::strings::JNIString;
+
+bind_java_type! {
+    pub Counter => com.example.Counter,
+    methods {
+        fn add(other: Counter) -> void,
+    },
+    fields {
+        count: jint,
+    },
+    hooks = {
+        load_class = |env, load_context, initialize| {
+            // The class is named `com.example.a` at runtime
+            load_context.load_class(env, jni::jni_str!("com.example.a"), initialize)
+        },
+        map_member = |_env, _load_context, _class, member| {
+            let name = match (member.kind, &*member.name.to_str()) {
+                (MemberKind::Method, "add") => JNIString::from("a"),
+                (MemberKind::Field, "count") => JNIString::from("b"),
+                _ => JNIString::from(member.name),
+            };
+            // Class names within signatures need to be mapped too
+            let sig = member.sig.to_str().replace("Lcom/example/Counter;", "Lcom/example/a;");
+            Ok((name, JNIString::from(sig)))
+        },
+    },
+}
+```
+
+The `map_member` hook must be an inline closure that receives:
+
+- `env: &mut Env<'local>` - JNI environment
+- `load_context: &LoaderContext` - Class loading context
+- `class: &JClass` - The loaded class
+- `member: jni::ids::MemberLookup<'static>` - The member's `kind` (a `jni::ids::MemberKind`),
+  the binding's Java `class_name`, and the member's `name` and JNI `sig`, as written in the binding
+
+The closure must return `Result<(N, S), jni::errors::Error>` with the name and signature to look
+up, where `N` and `S` implement `AsRef<JNIStr>`. Returning `member.name` and `member.sig` keeps
+them unchanged.
+
+The hook is called for each member when the binding's API is initialized (the first time the
+binding is used):
+
+- The returned signature must have the same argument and return types as the binding's
+  signature (only class names may differ), and constructors can't be renamed. Otherwise
+  initialization fails with `Error::InvalidMemberMapping`.
+- Errors from the hook, or from looking up the returned name, are returned from initialization
+  like any other lookup failure. Failed initialization isn't cached, so the hook may be called
+  again (it may also be called more than once if threads race to initialize the binding).
+
+Native methods are still registered and exported under the names written in the binding, and
+`Reference::class_name()` still returns the class name written in the binding, since other
+bindings' `type_map` entries are checked against it. Because `JObjectArray<T>` looks up its class
+by a name derived from `T::class_name()`, casting to an array of a renamed class isn't supported.
+
 ## Wrapper Macros
 
 Create custom wrapper macros to encapsulate common configuration across multiple bindings:

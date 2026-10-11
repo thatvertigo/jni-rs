@@ -1079,5 +1079,43 @@ specific class loaders, loading from non-standard locations, or applying bytecod
 See the [Custom Class Loading](bind_java_type_advanced.md#custom-class-loading) section
 in the Advanced chapter for complete details.
 
+## `map_member` Hook
+
+Change the name and signature used to look up each method, field and constructor ID at runtime.
+
+```rust
+# use jni::bind_java_type;
+# use jni::ids::MemberKind;
+# use jni::strings::JNIString;
+bind_java_type! {
+    pub MyType => com.example.MyClass,
+    methods {
+        fn get_value() -> jint,
+    },
+    hooks = {
+        map_member = |_env, _load_context, _class, member| {
+            // For example, look up the runtime name in a mapping table
+            let name = match (member.kind, &*member.name.to_str()) {
+                (MemberKind::Method, "getValue") => JNIString::from("a"),
+                _ => JNIString::from(member.name),
+            };
+            Ok((name, JNIString::from(member.sig)))
+        },
+    },
+}
+```
+
+The `map_member` hook must be an inline closure (not a function name) that receives
+`env: &mut Env`, `load_context: &LoaderContext`, `class: &JClass` and
+`member: jni::ids::MemberLookup`, which gives the member's kind, the binding's Java class name,
+and the member's name and JNI signature as written in the binding. It must return
+`Result<(N, S), jni::errors::Error>` with the name and signature to look up, where `N` and `S`
+implement `AsRef<JNIStr>` (such as `JNIString` or `&'static JNIStr`). This allows bindings to be
+used with obfuscated or remapped builds of a library, where members have different names at
+runtime.
+
+See the [Runtime Member Names](bind_java_type_advanced.md#runtime-member-names) section
+in the Advanced chapter for complete details.
+
 [Reference]: https://docs.rs/jni/latest/jni/refs/trait.Reference.html
 [`jni_sig!`]: macro.jni_sig.html

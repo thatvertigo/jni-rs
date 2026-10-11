@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `JNIVersion::V24` constant for JNI version 24.0 ([#819](https://github.com/jni-rs/jni-rs/pull/819))
+- `bind_java_type` supports a `map_member` hook to change the names and signatures used to look up method and field IDs at runtime (e.g. for obfuscated builds of a library)
 
 ### Fixed
 

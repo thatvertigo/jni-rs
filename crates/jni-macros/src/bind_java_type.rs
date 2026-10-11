@@ -968,6 +968,7 @@ struct BindClassInput {
     native_methods: Vec<NativeMethod>,
     load_class_closure: Option<TokenStream>,
     init_priv_closure: Option<TokenStream>,
+    map_member_closure: Option<TokenStream>,
     native_methods_export: bool,
     native_methods_catch_unwind: bool,
     abi_check: AbiCheck,
@@ -1011,6 +1012,7 @@ impl Parse for BindClassInput {
         let mut native_methods = Vec::new();
         let mut load_class_closure = None;
         let mut init_priv_closure = None;
+        let mut map_member_closure = None;
         let mut native_methods_export = true;
         let mut native_methods_catch_unwind = true;
         let mut abi_check = AbiCheck::default();
@@ -1176,6 +1178,9 @@ impl Parse for BindClassInput {
                             }
                             "init_priv" => {
                                 init_priv_closure = Some(closure_tokens);
+                            }
+                            "map_member" => {
+                                map_member_closure = Some(closure_tokens);
                             }
                             _ => {
                                 return Err(syn::Error::new(
@@ -1369,6 +1374,7 @@ impl Parse for BindClassInput {
             native_methods,
             load_class_closure,
             init_priv_closure,
+            map_member_closure,
             native_methods_export,
             native_methods_catch_unwind,
             abi_check,
@@ -1417,17 +1423,23 @@ pub fn bind_java_type_impl(input: TokenStream) -> Result<TokenStream> {
         jni,
     );
 
+    // The Java class name to pass to the map_member hook, if there is one
+    let map_class = input
+        .map_member_closure
+        .as_ref()
+        .map(|_| java_class_dotted.as_str());
+
     // Generate constructor method ID fields and initialization code
     let (constructor_method_id_fields, constructor_method_id_inits) =
-        generate_constructor_method_ids(&input.constructors, &input.type_mappings, jni)?;
+        generate_constructor_method_ids(&input.constructors, &input.type_mappings, map_class, jni)?;
 
     // Generate method ID fields and initialization code for methods
     let (method_id_fields, method_id_inits) =
-        generate_method_ids(&input.methods, &input.type_mappings, jni)?;
+        generate_method_ids(&input.methods, &input.type_mappings, map_class, jni)?;
 
     // Generate field ID fields and initialization code for fields
     let (field_id_fields, field_id_inits) =
-        generate_field_ids(&input.fields, &input.type_mappings, jni)?;
+        generate_field_ids(&input.fields, &input.type_mappings, map_class, jni)?;
 
     // Combine all ID fields and inits
     let all_id_fields = [
@@ -1472,6 +1484,7 @@ pub fn bind_java_type_impl(input: TokenStream) -> Result<TokenStream> {
         &java_class_dotted,
         input.load_class_closure.as_ref(),
         input.init_priv_closure.as_ref(),
+        input.map_member_closure.as_ref(),
         input.priv_type.as_ref(),
         &all_id_inits,
         &native_registration_code,
@@ -1636,6 +1649,7 @@ fn generate_api_get_method(
     java_class: &str,
     load_class_closure: Option<&TokenStream>,
     init_priv_closure: Option<&TokenStream>,
+    map_member_closure: Option<&TokenStream>,
     priv_type: Option<&Ident>,
     method_id_inits: &[TokenStream],
     native_registration_code: &TokenStream,
@@ -1651,6 +1665,10 @@ fn generate_api_get_method(
     );
     let init_priv_wrapper_name = format_ident!(
         "__{}_init_priv_wrapper",
+        type_name.to_string().to_lowercase()
+    );
+    let map_member_wrapper_name = format_ident!(
+        "__{}_map_member_wrapper",
         type_name.to_string().to_lowercase()
     );
 
@@ -1707,6 +1725,29 @@ fn generate_api_get_method(
         quote! {}
     };
 
+    // The map_member wrapper only constrains the closure's type, since the
+    // closure is called once for each member ID lookup
+    let map_member_wrapper = if map_member_closure.is_some() {
+        quote! {
+            #[allow(unused, non_snake_case)]
+            fn #map_member_wrapper_name<'env_local, F, N, S>(map_member: F) -> F
+            where
+                F: FnMut(
+                    &mut #jni::Env<'env_local>,
+                    &#jni::refs::LoaderContext,
+                    &#jni::objects::JClass,
+                    #jni::ids::MemberLookup<'static>,
+                ) -> #jni::errors::Result<(N, S)>,
+                N: ::core::convert::AsRef<#jni::strings::JNIStr>,
+                S: ::core::convert::AsRef<#jni::strings::JNIStr>,
+            {
+                map_member
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Generate the class loading code
     let load_class_code = if let Some(closure) = load_class_closure {
         quote! {
@@ -1722,6 +1763,16 @@ fn generate_api_get_method(
     let init_priv_code = if let Some(closure) = init_priv_closure {
         quote! {
             let private = #init_priv_wrapper_name(env, loader, class, #closure)?;
+        }
+    } else {
+        quote! {}
+    };
+
+    // Bind the map_member hook, used by the method and field ID initialization code
+    let map_member_code = if let Some(closure) = map_member_closure {
+        quote! {
+            #[allow(unused_mut, unused_variables)]
+            let mut map_member_hook = #map_member_wrapper_name(#closure);
         }
     } else {
         quote! {}
@@ -1773,6 +1824,7 @@ fn generate_api_get_method(
     Ok(quote! {
         #load_class_wrapper
         #init_priv_wrapper
+        #map_member_wrapper
 
         impl #api_name {
             pub fn get(
@@ -1836,6 +1888,8 @@ fn generate_api_get_method(
 
                     // Assert that all type mappings are correct
                     #type_mapping_runtime_checks
+
+                    #map_member_code
 
                     let api = #api_construction;
 
@@ -2195,13 +2249,20 @@ struct IdLookup {
     signature: String,
     /// The function to call for lookup (e.g., "get_method_id", "get_static_field_id")
     lookup_fn: Ident,
+    /// The `jni::ids::MemberKind` variant for this lookup (e.g., "Constructor", "StaticField")
+    member_kind: Ident,
     /// The cfg attributes to apply to this ID (e.g., #[cfg(feature = "foo")])
     cfg_attrs: Vec<syn::Attribute>,
 }
 
 /// Generate field and initialization code from IdLookup descriptors
+///
+/// `map_member` is the binding's Java class name if it has a `map_member`
+/// hook, which is expected to be bound to a `map_member_hook` variable in the
+/// scope of the initialization code.
 fn generate_id_fields_and_inits(
     lookups: Vec<IdLookup>,
+    map_member: Option<&str>,
     jni: &syn::Path,
 ) -> (Vec<TokenStream>, Vec<TokenStream>) {
     let mut fields = Vec::new();
@@ -2225,6 +2286,38 @@ fn generate_id_fields_and_inits(
         });
 
         // Add initialization with cfg guards
+        if let Some(java_class) = map_member {
+            let member_kind = &lookup.member_kind;
+            let class_cstr = lit_cstr_mutf8(java_class);
+            let sig_cstr = lit_cstr_mutf8(signature);
+            let (map_signature, to_signature) = match member_kind.to_string().as_str() {
+                "Field" | "StaticField" => (
+                    format_ident!("__map_field_signature"),
+                    format_ident!("field_signature"),
+                ),
+                _ => (
+                    format_ident!("__map_method_signature"),
+                    format_ident!("method_signature"),
+                ),
+            };
+            inits.push(quote! {
+                #(#cfg_attrs)*
+                #field_name: {
+                    let lookup = #jni::ids::MemberLookup {
+                        kind: #jni::ids::MemberKind::#member_kind,
+                        class_name: #jni::strings::JNIStr::from_cstr_unchecked(#class_cstr),
+                        name: #jni::strings::JNIStr::from_cstr_unchecked(#name_cstr),
+                        sig: #jni::strings::JNIStr::from_cstr_unchecked(#sig_cstr),
+                    };
+                    let (name, sig) = map_member_hook(env, loader, class, lookup)?;
+                    let name = ::core::convert::AsRef::<#jni::strings::JNIStr>::as_ref(&name);
+                    let sig = ::core::convert::AsRef::<#jni::strings::JNIStr>::as_ref(&sig);
+                    let sig = lookup.#map_signature(&#jni::jni_sig!(jni=#jni, #signature), name, sig)?;
+                    env.#lookup_fn(class, name, sig.#to_signature())?
+                },
+            });
+            continue;
+        }
         inits.push(quote! {
             #(#cfg_attrs)*
             #field_name: env.#lookup_fn(class, #jni::strings::JNIStr::from_cstr_unchecked(#name_cstr), #jni::jni_sig!(jni=#jni, #signature))?,
@@ -2238,6 +2331,7 @@ fn generate_id_fields_and_inits(
 fn generate_constructor_method_ids(
     constructors: &[Constructor],
     type_mappings: &TypeMappings,
+    map_member: Option<&str>,
     jni: &syn::Path,
 ) -> Result<(Vec<TokenStream>, Vec<TokenStream>)> {
     let mut lookups = Vec::new();
@@ -2268,11 +2362,12 @@ fn generate_constructor_method_ids(
             java_name: "<init>".to_string(),
             signature: jni_sig_str,
             lookup_fn: format_ident!("get_method_id"),
+            member_kind: format_ident!("Constructor"),
             cfg_attrs,
         });
     }
 
-    Ok(generate_id_fields_and_inits(lookups, jni))
+    Ok(generate_id_fields_and_inits(lookups, map_member, jni))
 }
 
 /// Convert a JavaType to a Rust native method trait argument type with lifetime
@@ -2418,6 +2513,7 @@ fn generate_constructors(
 fn generate_method_ids(
     methods: &[Method],
     type_mappings: &TypeMappings,
+    map_member: Option<&str>,
     jni: &syn::Path,
 ) -> Result<(Vec<TokenStream>, Vec<TokenStream>)> {
     let mut lookups = Vec::new();
@@ -2454,6 +2550,12 @@ fn generate_method_ids(
             quote! { #jni::ids::JMethodID }
         };
 
+        let member_kind = if is_static {
+            format_ident!("StaticMethod")
+        } else {
+            format_ident!("Method")
+        };
+
         let cfg_attrs = extract_cfg_attrs(&method.attrs);
 
         lookups.push(IdLookup {
@@ -2462,17 +2564,19 @@ fn generate_method_ids(
             java_name: java_name.clone(),
             signature: jni_sig_str,
             lookup_fn,
+            member_kind,
             cfg_attrs,
         });
     }
 
-    Ok(generate_id_fields_and_inits(lookups, jni))
+    Ok(generate_id_fields_and_inits(lookups, map_member, jni))
 }
 
 /// Generate field ID fields and initialization code for fields
 fn generate_field_ids(
     fields: &[Field],
     type_mappings: &TypeMappings,
+    map_member: Option<&str>,
     jni: &syn::Path,
 ) -> Result<(Vec<TokenStream>, Vec<TokenStream>)> {
     let mut lookups = Vec::new();
@@ -2508,6 +2612,12 @@ fn generate_field_ids(
             quote! { #jni::ids::JFieldID }
         };
 
+        let member_kind = if field.is_static {
+            format_ident!("StaticField")
+        } else {
+            format_ident!("Field")
+        };
+
         let cfg_attrs = extract_cfg_attrs(&field.attrs);
 
         lookups.push(IdLookup {
@@ -2516,11 +2626,12 @@ fn generate_field_ids(
             java_name: java_name.clone(),
             signature: field_sig,
             lookup_fn,
+            member_kind,
             cfg_attrs,
         });
     }
 
-    Ok(generate_id_fields_and_inits(lookups, jni))
+    Ok(generate_id_fields_and_inits(lookups, map_member, jni))
 }
 
 /// Helper struct to hold processed JNI call arguments data
